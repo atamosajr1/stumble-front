@@ -1,0 +1,7 @@
+{
+  "name": "StumbleLegal",
+  "displayName": "StumbleLegal",
+  "plugins": [
+    "expo-font"
+  ]
+}

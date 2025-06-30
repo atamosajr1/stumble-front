@@ -1,0 +1,233 @@
+definitions:
+  instance_set_up: &instance_set_up
+    instance_type: mac_mini_m1
+    max_build_duration: 120
+  instrument_versions: &instrument_versions
+    node: 18
+    xcode: 16.2
+    cocoapods: default
+  app_vars: &app_vars
+    APP_NAME: 'StumbleLegal'
+    XCODE_WORKSPACE: '$APP_NAME.xcworkspace'
+    XCODE_PROJECT: '$APP_NAME.xcodeproj'
+    BUNDLE_ID: $BUNDLE_ID
+  scripts:
+    - &install_npm_deps
+      name: Install npm dependencies
+      script: |
+        yarn install --no-immutable
+    - &pull_aws_secrets
+      name: Pull project secrets from AWS
+      script: |
+        npm run get-aws-secrets:$ENV
+    - &set_env_values
+      name: Set values from .env
+      script: |
+        source .env
+
+        echo "BUNDLE_ID=$IOS_BUNDLE_ID" >> $CM_ENV
+
+        sed -i '' "s/PRODUCT_BUNDLE_IDENTIFIER = .*$/PRODUCT_BUNDLE_IDENTIFIER = \"$IOS_BUNDLE_ID\";/g" "$CM_BUILD_DIR/ios/$XCODE_PROJECT/project.pbxproj"
+    - &install_cocoapods_deps
+      name: Install CocoaPods dependencies
+      script: |
+        npx pod-install
+    - &ios_initialize_keychain
+      name: Set up keychain to be used for codesigning using Codemagic CLI 'keychain' command
+      script: |
+        keychain initialize
+    - &fetch_signing_files
+      name: Fetch signing files, i.e. certificates, profiles, etc.
+      script: |
+        app-store-connect fetch-signing-files "$BUNDLE_ID" --type IOS_APP_STORE --create
+    - &add_certs_to_keychain
+      name: Add certs to keychain
+      script: |
+        keychain add-certificates
+    - &use_profiles
+      name: Set up code signing settings on Xcode project
+      script: |
+        xcode-project use-profiles --warn-only
+    - &increment_ios_build_number
+      name: Increment build number and set store version
+      script: |
+        #!/bin/sh
+        set -e
+        set -x
+        STORE_VERSION=$(cat "$CM_BUILD_DIR/version.txt")
+        cd $CM_BUILD_DIR/ios
+        LATEST_BUILD_NUMBER=$(app-store-connect get-latest-app-store-build-number "$APP_STORE_APP_ID" --app-store-version=$STORE_VERSION)
+        agvtool new-marketing-version $STORE_VERSION
+        agvtool new-version -all $(($LATEST_BUILD_NUMBER + 1))
+        echo "NEW_BUILD_NUMBER=$NEW_BUILD_NUMBER" >> $CM_ENV
+    - &build_ipa
+      name: Build ipa for distribution
+      script: |
+        xcode-project build-ipa --workspace "$CM_BUILD_DIR/ios/$XCODE_WORKSPACE" --scheme "$XCODE_SCHEME" --verbose
+    - &generate_notes
+      name: Generate release notes
+      script: |
+        #!/bin/sh
+        set -ex
+
+        echo "New build number $NEW_BUILD_NUMBER"
+
+        JSON_FILE="release_notes.json"
+
+        RELEASE_NOTES_HEADER="Environment: $ENV\\nBuild ID: $NEW_BUILD_NUMBER"
+        RELEASE_NOTES=$(git-changelog generate --previous-commit "$CM_PREVIOUS_COMMIT" --commit-limit 10)
+
+        node <<EOF
+        const fs = require('fs');
+
+        let data = fs.readFileSync('./${JSON_FILE}');
+        data = JSON.parse(data);
+        data[0].text = \`${RELEASE_NOTES_HEADER}\n\n${RELEASE_NOTES}\`;
+        fs.writeFileSync('./${JSON_FILE}', JSON.stringify(data));
+        EOF
+  artifacts:
+    - &ipa build/ios/ipa/*.ipa
+    - &xcode_log /tmp/xcodebuild_logs/*.log
+    - &app $HOME/Library/Developer/Xcode/DerivedData/**/Build/**/*.app
+    - &dsym $HOME/Library/Developer/Xcode/DerivedData/**/Build/**/*.dSYM
+    - &notes $CM_BUILD_DIR/release_notes.json
+  slack_publish: &slack_publish
+    slack:
+      channel: '#build_stumble_legal'
+      notify_on_build_start: false
+      notify:
+        success: true
+        failure: true
+  inner_testflight_publish: &inner_testflight_publish
+    app_store_connect:
+      api_key: $APP_STORE_CONNECT_PRIVATE_KEY
+      key_id: $APP_STORE_CONNECT_KEY_IDENTIFIER
+      issuer_id: $APP_STORE_CONNECT_ISSUER_ID
+
+workflows:
+  react-native-ios-dev:
+    name: Build & Publish StumbleLegal (iOS / dev)
+    <<: *instance_set_up
+    environment:
+      <<: *instrument_versions
+      groups:
+        - appstore_credentials
+        - aws_keys
+      vars:
+        ENV: 'dev'
+        XCODE_SCHEME: '$APP_NAME'
+        APP_STORE_APP_ID: '_'
+        <<: *app_vars
+    triggering:
+      events:
+        - push
+        - tag
+      branch_patterns:
+        - pattern: dev
+          include: true
+      tag_patterns:
+        - pattern: ios-build
+          include: true
+      cancel_previous_builds: true
+    scripts:
+      - *install_npm_deps
+      - *pull_aws_secrets
+      - *set_env_values
+      - *ios_initialize_keychain
+      - *fetch_signing_files
+      - *add_certs_to_keychain
+      - *use_profiles
+      - *increment_ios_build_number
+      - *generate_notes
+      - *install_cocoapods_deps
+      - *build_ipa
+    artifacts:
+      - *ipa
+      - *dsym
+      - *app
+      - *xcode_log
+      - *notes
+    publishing:
+      <<: *slack_publish
+      <<: *inner_testflight_publish
+
+  react-native-ios-stage:
+    name: Build & Publish StumbleLegal (iOS / stage)
+    <<: *instance_set_up
+    environment:
+      <<: *instrument_versions
+      groups:
+        - appstore_credentials
+        - aws_keys
+      vars:
+        ENV: 'stage'
+        XCODE_SCHEME: '$APP_NAME (Stage)'
+        APP_STORE_APP_ID: '_'
+        <<: *app_vars
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: stage
+          include: true
+      cancel_previous_builds: true
+    scripts:
+      - *install_npm_deps
+      - *pull_aws_secrets
+      - *set_env_values
+      - *ios_initialize_keychain
+      - *fetch_signing_files
+      - *add_certs_to_keychain
+      - *use_profiles
+      - *increment_ios_build_number
+      - *generate_notes
+      - *install_cocoapods_deps
+      - *build_ipa
+    artifacts:
+      - *ipa
+      - *dsym
+      - *app
+      - *xcode_log
+    publishing:
+      <<: *slack_publish
+      <<: *inner_testflight_publish
+
+  react-native-ios-prod:
+    name: Build & Publish StumbleLegal (iOS / prod)
+    <<: *instance_set_up
+    environment:
+      <<: *instrument_versions
+      groups:
+        - appstore_credentials
+        - aws_keys
+      vars:
+        ENV: 'prod'
+        XCODE_SCHEME: '$APP_NAME (Production)'
+        APP_STORE_APP_ID: '6746454377'
+        <<: *app_vars
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: '{main,master}'
+      cancel_previous_builds: true
+    scripts:
+      - *install_npm_deps
+      - *pull_aws_secrets
+      - *set_env_values
+      - *ios_initialize_keychain
+      - *fetch_signing_files
+      - *add_certs_to_keychain
+      - *use_profiles
+      - *increment_ios_build_number
+      - *generate_notes
+      - *install_cocoapods_deps
+      - *build_ipa
+    artifacts:
+      - *ipa
+      - *dsym
+      - *app
+      - *xcode_log
+    publishing:
+      <<: *slack_publish
+      <<: *inner_testflight_publish
